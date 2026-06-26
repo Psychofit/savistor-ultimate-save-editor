@@ -110,13 +110,21 @@ export function detect(bytes: Uint8Array): Detection {
   if (printableText) {
     const text = utf8Decode(bytes.subarray(0, 65536)).trim();
     const firstChar = text[0];
-    if (firstChar === "{" || firstChar === "[") {
-      const isJson = tryJson(text);
+    if (tryJson(text)) {
+      guesses.push({ id: "json", label: "JSON text", confidence: 0.95, reason: "parses as JSON" });
+    } else if (looksLikeKeyValueIni(text)) {
+      guesses.push({
+        id: "ini",
+        label: "INI / key=value text",
+        confidence: 0.75,
+        reason: "INI-style sections and key=value lines",
+      });
+    } else if (firstChar === "{" || firstChar === "[") {
       guesses.push({
         id: "json",
         label: "JSON text",
-        confidence: isJson ? 0.95 : 0.6,
-        reason: isJson ? "parses as JSON" : "starts with { or [ (JSON-like)",
+        confidence: 0.6,
+        reason: "starts with { or [ (JSON-like) but does not fully parse",
       });
     } else if (firstChar === "<") {
       guesses.push({ id: "xml", label: "XML / HTML text", confidence: 0.7, reason: "starts with '<'" });

@@ -30,13 +30,29 @@ checksum the game verifies on load. Savistor is built around that reality.
 
 ### Profiles shipped today
 
-| Profile | Recipe |
-| --- | --- |
-| RPG Maker MV / MZ (`.rpgsave` / `.rmmzsave`) | lz-string Base64 → JSON |
-| gzip-compressed JSON | gzip → JSON |
-| zlib-compressed JSON | zlib → JSON |
-| Base64-encoded JSON | Base64 → JSON |
-| Plain JSON | (none) |
+| Profile | Recipe | Editor |
+| --- | --- | --- |
+| **Unreal Engine compressed save** (e.g. System Shock 2023, `.sav`) | Unreal chunked-compression container → raw inner bytes | Binary tools (search / patch / export) |
+| **INI / key=value save** (e.g. Hole Dweller / Unity, `.sav`) | plain `[Section]` + `KEY="value"` text | Structured field editor |
+| RPG Maker MV / MZ (`.rpgsave` / `.rmmzsave`) | lz-string Base64 → JSON | Text / JSON |
+| gzip-compressed JSON | gzip → JSON | Text / JSON |
+| zlib-compressed JSON | zlib → JSON | Text / JSON |
+| Base64-encoded JSON | Base64 → JSON | Text / JSON |
+| Plain JSON | (none) | Text / JSON |
+
+Both `.sav` examples above are files that other popular editors **refuse to even
+open**. Savistor opens them, lets you edit, and rebuilds a structurally faithful
+file (verified by lossless decode → encode → decode round-trips).
+
+#### Editors
+
+- **Text / JSON** — with validation and pretty-print.
+- **Fields (INI)** — every `KEY=value` becomes a labelled input; quoting, comments,
+  blank lines and CRLF are preserved exactly on save.
+- **Hex** — editable hex for small binary payloads.
+- **Binary tools** — for large payloads (e.g. a 2.3 MB decompressed Unreal save):
+  ASCII string search → byte offsets, patch-at-offset, and export/re-import of the
+  raw inner bytes so you can use a dedicated hex editor and let Savistor re-wrap it.
 
 ## What it does **not** do (yet) — the honest part
 
@@ -45,9 +61,13 @@ checksum the game verifies on load. Savistor is built around that reality.
   future decrypt codec) — no tool can edit truly-encrypted data without it.
 - It does **not** ship per-game field editors ("set Strength to 99") except via
   the profiles above. Those are added from **real sample saves** — see below.
-- Engine-specific binary serializations (Unity `BinaryFormatter`, Unreal `GVAS`
-  property trees, protobuf without a schema) are **detected/flagged** but not
-  yet fully parsed.
+- Engine-specific binary serializations are **opened but not yet parsed into
+  named fields**. For Unreal saves we decompress to the raw inner payload (which
+  is UE tagged-property data — `NameProperty`, `IntProperty`, `StructProperty`,
+  …) and let you search/patch it at the byte level; a full UE property-tree
+  parser (à la `uesave`) that surfaces those as editable fields is the natural
+  next step. Unity `BinaryFormatter` and schema-less protobuf are likewise
+  flagged but not decoded.
 
 If a tool tells you it supports "all `.sav` files," it's guessing. Savistor tells
 you what it can prove about *your* file.

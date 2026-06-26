@@ -1,86 +1,106 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import {
+  PayloadKind,
   detect,
-  fromHex,
-  getProfile,
-  matchProfiles,
-  toHex,
-  utf8Decode,
-  utf8Encode,
   formatSize,
+  getProfile,
+  looksLikeIni,
+  matchProfiles,
+  utf8Decode,
 } from "./core";
 import { PipelineStep, decodePipeline, encodePipeline } from "./core/pipeline";
 import { Checksums, HexPreview, Inspector, PipelineEditor } from "./ui/components";
-import { downloadBytes, suggestOutputName, tryFormatJson } from "./ui/format";
+import { BinaryEditor, HexEditor, IniEditor, TextEditor } from "./ui/editors";
+import { downloadBytes, suggestOutputName } from "./ui/format";
 
-type EditMode = "text" | "hex";
+type View = "text" | "ini" | "hex" | "binary";
+const LARGE = 256 * 1024;
 
 interface LoadedFile {
   name: string;
   bytes: Uint8Array;
 }
 
-/** Render payload bytes into the textarea string for a given edit mode. */
-function render(bytes: Uint8Array, mode: EditMode): string {
-  if (mode === "hex") return toHex(bytes, " ").replace(/((?:[0-9a-f]{2} ){16})/g, "$1\n");
-  return utf8Decode(bytes);
-}
+const VIEW_LABELS: Record<View, string> = {
+  text: "Text / JSON",
+  ini: "Fields (INI)",
+  hex: "Hex",
+  binary: "Binary tools",
+};
 
-/** Parse the textarea string back into payload bytes. May throw for bad hex. */
-function parse(text: string, mode: EditMode): Uint8Array {
-  return mode === "hex" ? fromHex(text) : utf8Encode(text);
+/** Decide which editor views make sense for a payload, and the default one. */
+function computeViews(payload: Uint8Array, kind?: PayloadKind): { views: View[]; view: View } {
+  const textLike = detect(payload).printableText;
+  const sample = textLike ? utf8Decode(payload.subarray(0, 65536)) : "";
+  const iniLike = textLike && (kind === "ini" || looksLikeIni(sample));
+  const small = payload.length <= LARGE;
+
+  const views: View[] = [];
+  if (small || textLike) views.push("text");
+  if (iniLike) views.push("ini");
+  if (small) views.push("hex");
+  if (!small) views.push("binary");
+  if (views.length === 0) views.push("hex");
+
+  let view: View;
+  if (kind === "binary") view = small ? "hex" : "binary";
+  else if (iniLike) view = "ini";
+  else if (kind === "json" || kind === "text" || textLike) view = "text";
+  else view = small ? "hex" : "binary";
+  if (!views.includes(view)) view = views[0];
+
+  return { views, view };
 }
 
 export function App() {
   const [file, setFile] = useState<LoadedFile | null>(null);
   const [steps, setSteps] = useState<PipelineStep[]>([]);
   const [activeProfileId, setActiveProfileId] = useState<string | undefined>();
-  const [editMode, setEditMode] = useState<EditMode>("text");
-  const [editedText, setEditedText] = useState("");
+  const [payload, setPayload] = useState<Uint8Array>(new Uint8Array());
+  const [views, setViews] = useState<View[]>([]);
+  const [view, setView] = useState<View>("text");
+  const [decodeKey, setDecodeKey] = useState(0);
+  const [pipelineError, setPipelineError] = useState<string | null>(null);
   const [exportStatus, setExportStatus] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Detection + profile suggestions for the loaded file.
   const detection = useMemo(() => (file ? detect(file.bytes) : null), [file]);
   const suggestions = useMemo(
     () => (file ? matchProfiles(file.bytes, file.name) : []),
     [file],
   );
 
-  // Decode the file through the current pipeline to get the editable payload.
-  const decodeRun = useMemo(
-    () => (file ? decodePipeline(file.bytes, steps) : null),
-    [file, steps],
+  /** Run a pipeline against source bytes and reset the editor to the result. */
+  const applyPipeline = useCallback(
+    (source: Uint8Array, nextSteps: PipelineStep[], kind?: PayloadKind, profileId?: string) => {
+      const run = decodePipeline(source, nextSteps);
+      const payloadBytes = run.ok ? run.output : source;
+      const failed = run.trace.find((t) => !t.ok);
+      const { views: vs, view: v } = computeViews(payloadBytes, run.ok ? kind : undefined);
+      setSteps(nextSteps);
+      setActiveProfileId(profileId);
+      setPayload(payloadBytes);
+      setViews(vs);
+      setView(v);
+      setPipelineError(run.ok ? null : `${failed?.codecId}: ${failed?.error}`);
+      setDecodeKey((k) => k + 1);
+      setExportStatus(null);
+    },
+    [],
   );
-
-  /** Reset the editor buffer from a freshly decoded payload. */
-  const resetEditor = useCallback((payload: Uint8Array, mode: EditMode) => {
-    setEditedText(render(payload, mode));
-    setEditMode(mode);
-  }, []);
 
   const loadBytes = useCallback(
     (name: string, bytes: Uint8Array) => {
-      setExportStatus(null);
-      const det = detect(bytes);
-      const matches = matchProfiles(bytes, name);
-      const best = matches[0];
       setFile({ name, bytes });
+      const best = matchProfiles(bytes, name)[0];
       if (best && best.match.confidence >= 0.8) {
-        const mode: EditMode = best.profile.payloadKind === "binary" ? "hex" : "text";
-        const decoded = decodePipeline(bytes, best.profile.pipeline);
-        setSteps(best.profile.pipeline);
-        setActiveProfileId(best.profile.id);
-        resetEditor(decoded.ok ? decoded.output : bytes, mode);
+        applyPipeline(bytes, best.profile.pipeline, best.profile.payloadKind, best.profile.id);
       } else {
-        const mode: EditMode = det.printableText ? "text" : "hex";
-        setSteps([]);
-        setActiveProfileId(undefined);
-        resetEditor(bytes, mode);
+        applyPipeline(bytes, [], undefined, undefined);
       }
     },
-    [resetEditor],
+    [applyPipeline],
   );
 
   const openFile = useCallback(
@@ -88,76 +108,30 @@ export function App() {
     [loadBytes],
   );
 
-  // --- pipeline / profile actions -------------------------------------------
-
   const applyProfile = (id: string) => {
     if (!file) return;
     const profile = getProfile(id);
     if (!profile) return;
-    const decoded = decodePipeline(file.bytes, profile.pipeline);
-    setSteps(profile.pipeline);
-    setActiveProfileId(id);
-    resetEditor(
-      decoded.ok ? decoded.output : file.bytes,
-      profile.payloadKind === "binary" ? "hex" : "text",
-    );
+    applyPipeline(file.bytes, profile.pipeline, profile.payloadKind, id);
   };
 
   const changeSteps = (next: PipelineStep[]) => {
     if (!file) return;
-    setSteps(next);
-    setActiveProfileId(undefined);
-    const decoded = decodePipeline(file.bytes, next);
-    if (decoded.ok) resetEditor(decoded.output, editMode);
+    applyPipeline(file.bytes, next, undefined, undefined);
   };
 
   const appendCodec = (codecId: string) => changeSteps([...steps, { codecId, options: {} }]);
 
-  // --- editor ----------------------------------------------------------------
+  const onPayloadBytes = useCallback((b: Uint8Array) => setPayload(b), []);
 
-  const switchMode = (mode: EditMode) => {
-    if (mode === editMode) return;
-    try {
-      const bytes = parse(editedText, editMode);
-      setEditedText(render(bytes, mode));
-      setEditMode(mode);
-    } catch (e) {
-      setExportStatus(`Cannot switch view: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  };
-
-  // Current edited payload as bytes (null when the hex is currently unpar. valid).
-  const editedBytes = useMemo(() => {
-    try {
-      return parse(editedText, editMode);
-    } catch {
-      return null;
-    }
-  }, [editedText, editMode]);
-
-  const jsonStatus = useMemo(() => {
-    if (editMode !== "text") return null;
-    const t = editedText.trim();
-    if (!(t.startsWith("{") || t.startsWith("["))) return null;
-    const res = tryFormatJson(editedText);
-    return res.ok ? { ok: true } : { ok: false, error: res.error };
-  }, [editedText, editMode]);
-
-  const formatJson = () => {
-    const res = tryFormatJson(editedText);
-    if (res.ok) setEditedText(res.text);
-    else setExportStatus(`Invalid JSON: ${res.error}`);
+  const switchView = (v: View) => {
+    if (v === view) return;
+    setView(v);
+    setDecodeKey((k) => k + 1); // remount editor so it re-seeds from current payload
   };
 
   const doExport = () => {
     if (!file) return;
-    let payload: Uint8Array;
-    try {
-      payload = parse(editedText, editMode);
-    } catch (e) {
-      setExportStatus(`Cannot encode: ${e instanceof Error ? e.message : String(e)}`);
-      return;
-    }
     const run = encodePipeline(payload, steps);
     if (!run.ok) {
       const failed = run.trace.find((t) => !t.ok);
@@ -171,14 +145,14 @@ export function App() {
     );
   };
 
-  // --- drag & drop -----------------------------------------------------------
-
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setDragging(false);
     const f = e.dataTransfer.files[0];
     if (f) void openFile(f);
   };
+
+  const editorKey = `${decodeKey}:${view}`;
 
   return (
     <div
@@ -246,21 +220,20 @@ export function App() {
 
             <PipelineEditor steps={steps} onChange={changeSteps} />
 
-            {decodeRun && !decodeRun.ok && (
+            {pipelineError && (
               <section className="panel error">
                 <h2>Pipeline error</h2>
                 <p>
-                  Failed at step{" "}
-                  <code>{decodeRun.trace.find((t) => !t.ok)?.codecId}</code>:{" "}
-                  {decodeRun.trace.find((t) => !t.ok)?.error}
+                  Failed at <code>{pipelineError}</code>
                 </p>
                 <p className="muted small">
-                  The bytes don't match this layer. Remove it or pick a different codec.
+                  The bytes don't match this layer. Remove it or pick a different codec. Showing the
+                  un-decoded bytes below.
                 </p>
               </section>
             )}
 
-            {editedBytes && <Checksums bytes={editedBytes} label="current payload" />}
+            <Checksums bytes={payload} label="current payload" />
             <HexPreview bytes={file.bytes} title="Original file" />
           </div>
 
@@ -269,41 +242,34 @@ export function App() {
               <div className="editor-head">
                 <h2>Payload editor</h2>
                 <div className="modes">
-                  <button
-                    className={editMode === "text" ? "active" : ""}
-                    onClick={() => switchMode("text")}
-                  >
-                    Text / JSON
-                  </button>
-                  <button
-                    className={editMode === "hex" ? "active" : ""}
-                    onClick={() => switchMode("hex")}
-                  >
-                    Hex
-                  </button>
-                  {editMode === "text" && (
-                    <button onClick={formatJson} title="Pretty-print JSON">
-                      Format JSON
+                  {views.map((v) => (
+                    <button
+                      key={v}
+                      className={view === v ? "active" : ""}
+                      onClick={() => switchView(v)}
+                    >
+                      {VIEW_LABELS[v]}
                     </button>
-                  )}
+                  ))}
                 </div>
               </div>
 
-              {jsonStatus && (
-                <p className={jsonStatus.ok ? "status good" : "status bad"}>
-                  {jsonStatus.ok ? "Valid JSON" : `Invalid JSON: ${jsonStatus.error}`}
-                </p>
-              )}
-              {editMode === "hex" && editedBytes === null && (
-                <p className="status bad">Hex is not parseable yet.</p>
-              )}
+              <p className="muted small">
+                Payload: {formatSize(payload.length)} ({payload.length.toLocaleString()} bytes)
+              </p>
 
-              <textarea
-                className={editMode === "hex" ? "code hex-edit" : "code"}
-                spellCheck={false}
-                value={editedText}
-                onChange={(e) => setEditedText(e.target.value)}
-              />
+              {view === "text" && (
+                <TextEditor key={editorKey} initial={payload} onBytes={onPayloadBytes} />
+              )}
+              {view === "hex" && (
+                <HexEditor key={editorKey} initial={payload} onBytes={onPayloadBytes} />
+              )}
+              {view === "ini" && (
+                <IniEditor key={editorKey} value={payload} onBytes={onPayloadBytes} />
+              )}
+              {view === "binary" && (
+                <BinaryEditor key={editorKey} value={payload} onBytes={onPayloadBytes} />
+              )}
 
               <div className="export">
                 <button className="primary" onClick={doExport}>

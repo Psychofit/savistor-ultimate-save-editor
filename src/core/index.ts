@@ -9,4 +9,5 @@ export * from "./detect";
 export * from "./codecs";
 export * from "./pipeline";
 export * from "./checksums";
+export * from "./ini";
 export * from "./profiles";

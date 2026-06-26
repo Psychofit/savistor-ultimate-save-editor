@@ -10,7 +10,15 @@
 
 import { gzip, ungzip, inflate, deflate, inflateRaw, deflateRaw } from "pako";
 import LZString from "lz-string";
-import { fromHex, latin1Decode, latin1Encode, toHex, utf8Decode, utf8Encode } from "./bytes";
+import {
+  concatBytes,
+  fromHex,
+  latin1Decode,
+  latin1Encode,
+  toHex,
+  utf8Decode,
+  utf8Encode,
+} from "./bytes";
 
 export type CodecOptions = Record<string, string | number | undefined>;
 
@@ -230,6 +238,96 @@ const lzRawCodec = makeLzCodec(
   LZString.compress,
 );
 
+/* -------------------------------------------------- Unreal compressed archive */
+
+// Unreal Engine writes compressed blobs (e.g. some .sav files) as a chain of
+// "compressed chunk" archives. Each archive is:
+//   int64 Tag            = PACKAGE_FILE_TAG (0x9E2A83C1)
+//   int64 ChunkSize      = max uncompressed bytes per block (e.g. 0x20000)
+//   int64 Summary.Comp   = total compressed size of this archive
+//   int64 Summary.Uncomp = total uncompressed size of this archive
+//   (per block) int64 Comp, int64 Uncomp        // ceil(Uncomp/ChunkSize) of them
+//   (per block) <compressed bytes>              // zlib or gzip
+// Decoding concatenates every block's inflated bytes. Encoding re-chunks the
+// payload at ChunkSize and rewrites the (recomputed) size fields, which is what
+// the engine reads back — so the rebuilt file is structurally faithful.
+const UE_TAG = 0x9e2a83c1;
+
+function readI64LE(dv: DataView, off: number): number {
+  const lo = dv.getUint32(off, true);
+  const hi = dv.getUint32(off + 4, true);
+  return hi * 0x100000000 + lo;
+}
+
+function i64LE(value: number): Uint8Array {
+  const b = new Uint8Array(8);
+  const dv = new DataView(b.buffer);
+  dv.setUint32(0, value >>> 0, true);
+  dv.setUint32(4, Math.floor(value / 0x100000000), true);
+  return b;
+}
+
+function ueDecode(input: Uint8Array): Uint8Array {
+  const dv = new DataView(input.buffer, input.byteOffset, input.byteLength);
+  if (input.length < 48 || dv.getUint32(0, true) !== UE_TAG) {
+    throw new Error("not an Unreal compressed archive (missing PACKAGE_FILE_TAG)");
+  }
+  const out: Uint8Array[] = [];
+  let off = 0;
+  while (off + 48 <= input.length && dv.getUint32(off, true) === UE_TAG) {
+    const chunkSize = readI64LE(dv, off + 8);
+    const totalUncomp = readI64LE(dv, off + 24);
+    if (chunkSize <= 0) throw new Error("invalid Unreal chunk size");
+    const numChunks = Math.max(1, Math.ceil(totalUncomp / chunkSize));
+    let p = off + 32;
+    const infos: Array<[number, number]> = [];
+    for (let i = 0; i < numChunks; i++) {
+      infos.push([readI64LE(dv, p), readI64LE(dv, p + 8)]);
+      p += 16;
+    }
+    for (const [comp] of infos) {
+      const blob = input.subarray(p, p + comp);
+      p += comp;
+      const magic = (blob[0] << 8) | blob[1];
+      out.push(magic === 0x1f8b ? ungzip(blob) : inflate(blob));
+    }
+    off = p;
+  }
+  return concatBytes(...out);
+}
+
+function ueEncode(payload: Uint8Array, opts?: CodecOptions): Uint8Array {
+  const chunkSize = Number(opts?.chunkSize) || 0x20000;
+  const useGzip = (opts?.blockFormat ?? "gzip") !== "zlib";
+  const parts: Uint8Array[] = [];
+  // One archive per chunk (matches how these saves are typically flushed).
+  const total = payload.length;
+  for (let o = 0; o < total || (total === 0 && o === 0); o += chunkSize) {
+    const chunk = payload.subarray(o, Math.min(o + chunkSize, total));
+    const comp = useGzip ? gzip(chunk) : deflate(chunk);
+    parts.push(i64LE(UE_TAG), i64LE(chunkSize));
+    parts.push(i64LE(comp.length), i64LE(chunk.length)); // summary
+    parts.push(i64LE(comp.length), i64LE(chunk.length)); // single chunk info
+    parts.push(comp);
+    if (total === 0) break;
+  }
+  return concatBytes(...parts);
+}
+
+const ueCompressedCodec: Codec = {
+  id: "ue-compressed",
+  label: "Unreal compressed archive",
+  description:
+    "Unreal Engine chunked-compression container (PACKAGE_FILE_TAG). Decodes to the inner payload; re-chunks and recompresses on save.",
+  group: "compression",
+  params: [
+    { name: "blockFormat", label: "Block compression", type: "select", options: ["gzip", "zlib"], default: "gzip" },
+    { name: "chunkSize", label: "Chunk size (bytes)", type: "text", placeholder: "131072" },
+  ],
+  decode: (input) => ueDecode(input),
+  encode: (input, opts) => ueEncode(input, opts),
+};
+
 /* ---------------------------------------------------------------- registry */
 
 export const CODECS: Codec[] = [
@@ -239,6 +337,7 @@ export const CODECS: Codec[] = [
   gzipCodec,
   zlibCodec,
   deflateRawCodec,
+  ueCompressedCodec,
   xorCodec,
   lzBase64Codec,
   lzUriCodec,

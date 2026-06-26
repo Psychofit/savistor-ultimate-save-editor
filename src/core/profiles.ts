@@ -11,9 +11,10 @@
  */
 
 import { looksLikeText, utf8Decode } from "./bytes";
+import { looksLikeIni } from "./ini";
 import { decodePipeline, PipelineStep } from "./pipeline";
 
-export type PayloadKind = "json" | "text" | "binary";
+export type PayloadKind = "json" | "text" | "ini" | "binary";
 
 export interface ProfileMatch {
   confidence: number;
@@ -137,6 +138,52 @@ const base64Json: GameProfile = {
   },
 };
 
+/* ----------------------------------------------- Unreal compressed save (.sav) */
+
+const unrealCompressed: GameProfile = {
+  id: "unreal-compressed",
+  name: "Unreal Engine compressed save",
+  description:
+    "Unreal .sav stored as a chain of compressed chunks (PACKAGE_FILE_TAG). Decodes to the raw inner save bytes — tested on System Shock (2023). Re-chunks & recompresses on save.",
+  extensions: [".sav"],
+  pipeline: [{ codecId: "ue-compressed", options: { blockFormat: "gzip" } }],
+  payloadKind: "binary",
+  match(bytes) {
+    if (bytes.length < 48) return null;
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (dv.getUint32(0, true) !== 0x9e2a83c1) return null;
+    const run = decodePipeline(bytes, this.pipeline);
+    if (!run.ok || run.output.length === 0) return null;
+    return {
+      confidence: 0.95,
+      reason: `Unreal compressed-chunk archive → ${run.output.length.toLocaleString()} bytes inner payload`,
+    };
+  },
+};
+
+/* ----------------------------------------------------- INI / key=value text save */
+
+const iniKeyValue: GameProfile = {
+  id: "ini-keyvalue",
+  name: "INI / key=value text save",
+  description:
+    "A flat [Section] + KEY=\"value\" text save (common in Unity games such as Hole Dweller). Edit values directly as fields.",
+  extensions: [".sav", ".save", ".ini", ".cfg", ".txt"],
+  pipeline: [],
+  payloadKind: "ini",
+  match(bytes) {
+    if (!looksLikeText(bytes)) return null;
+    let text: string;
+    try {
+      text = utf8Decode(bytes, true);
+    } catch {
+      return null;
+    }
+    if (!looksLikeIni(text)) return null;
+    return { confidence: 0.86, reason: "INI-style sections and KEY=value lines" };
+  },
+};
+
 /* ---------------------------------------------------------------- plain JSON */
 
 const plainJson: GameProfile = {
@@ -155,7 +202,15 @@ const plainJson: GameProfile = {
 
 /* ---------------------------------------------------------------- registry */
 
-export const PROFILES: GameProfile[] = [rpgMaker, gzipJson, zlibJson, base64Json, plainJson];
+export const PROFILES: GameProfile[] = [
+  unrealCompressed,
+  rpgMaker,
+  gzipJson,
+  zlibJson,
+  base64Json,
+  iniKeyValue,
+  plainJson,
+];
 
 export interface ProfileSuggestion {
   profile: GameProfile;

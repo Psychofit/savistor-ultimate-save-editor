@@ -3,14 +3,18 @@ import { gzip } from "pako";
 import LZString from "lz-string";
 import {
   adler32,
+  bytesEqual,
   crc32,
   decodePipeline,
   detect,
   encodePipeline,
   fromHex,
   getCodec,
+  looksLikeIni,
   matchProfiles,
   md5,
+  parseIni,
+  serializeIni,
   sha,
   shannonEntropy,
   toHex,
@@ -133,6 +137,53 @@ describe("detection", () => {
     for (let i = 0; i < rnd.length; i++) rnd[i] = Math.floor(Math.random() * 256);
     const d = detect(rnd);
     expect(d.likelyCompressedOrEncrypted).toBe(true);
+  });
+});
+
+describe("Unreal compressed codec", () => {
+  const c = getCodec("ue-compressed")!;
+
+  it("round-trips a payload spanning multiple chunks, with the UE tag header", () => {
+    const payload = new Uint8Array(300_000);
+    for (let i = 0; i < payload.length; i++) payload[i] = (i * 2654435761) >>> 24;
+    const wrapped = c.encode(payload, { chunkSize: 131072, blockFormat: "gzip" });
+    const dv = new DataView(wrapped.buffer, wrapped.byteOffset, wrapped.byteLength);
+    expect(dv.getUint32(0, true)).toBe(0x9e2a83c1); // PACKAGE_FILE_TAG
+    expect(bytesEqual(c.decode(wrapped), payload)).toBe(true);
+  });
+
+  it("also decodes archives whose blocks are zlib", () => {
+    const payload = utf8Encode("hello unreal ".repeat(200));
+    const wrapped = c.encode(payload, { blockFormat: "zlib" });
+    expect(bytesEqual(c.decode(wrapped), payload)).toBe(true);
+  });
+
+  it("rejects non-Unreal data", () => {
+    expect(() => c.decode(utf8Encode("not unreal"))).toThrow();
+  });
+});
+
+describe("INI", () => {
+  it("round-trips faithfully including CRLF, comments, blanks and quotes", () => {
+    const text = '[Progress]\r\n; a comment\r\nGOLD="5.000000"\r\nNAME=Hero\r\n\r\n';
+    expect(serializeIni(parseIni(text))).toBe(text);
+  });
+
+  it("edits a quoted value while preserving the quotes", () => {
+    const doc = parseIni('[S]\nHP="100"\n');
+    const pair = doc.nodes.find((n) => n.type === "pair");
+    if (pair && pair.type === "pair") pair.value = "999";
+    expect(serializeIni(doc)).toBe('[S]\nHP="999"\n');
+  });
+
+  it("recognizes INI vs JSON", () => {
+    expect(looksLikeIni("[A]\nx=1\ny=2\n")).toBe(true);
+    expect(looksLikeIni('{"a":1,"b":2}')).toBe(false);
+  });
+
+  it("detection labels [section]-leading text as INI, not JSON", () => {
+    const d = detect(utf8Encode('[Progress]\nGOLD="5"\nHP="100"\n'));
+    expect(d.best?.id).toBe("ini");
   });
 });
 
